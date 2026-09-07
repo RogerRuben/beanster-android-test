@@ -1,0 +1,79 @@
+name: Beanster Android app acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  android-app-acceptance:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Reconstruct Beanster app sources and exact user image
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, pathlib
+          root=pathlib.Path('.')
+          def unpack(src,dst):
+              data=base64.b64decode((root/src).read_text())
+              (root/dst).parent.mkdir(parents=True,exist_ok=True)
+              (root/dst).write_bytes(gzip.decompress(data))
+          unpack('ci/MainActivity.kt.gz.b64','app/src/main/java/com/sipsqueak/v7/MainActivity.kt')
+          unpack('ci/index.html.gz.b64','app/src/main/assets/index.html')
+          b64=''.join((root/f'ci/acceptance.part{i:02d}').read_text() for i in range(3))
+          p=root/'app/src/main/assets/ocr/acceptance.jpg'; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(base64.b64decode(b64))
+          print('acceptance bytes',p.stat().st_size)
+          PY
+          shasum -a 256 app/src/main/assets/ocr/acceptance.jpg
+
+      - name: Download Simplified Chinese Tesseract data
+        run: |
+          mkdir -p app/src/main/assets/tessdata
+          curl -fL --retry 4 --retry-delay 2 \
+            https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/chi_sim.traineddata \
+            -o app/src/main/assets/tessdata/chi_sim.traineddata
+          test -s app/src/main/assets/tessdata/chi_sim.traineddata
+          shasum -a 256 app/src/main/assets/tessdata/chi_sim.traineddata
+
+      - name: Build Beanster APKs
+        run: gradle --no-daemon :app:assembleDebug :app:assembleRelease
+
+      - name: Run acceptance inside Beanster on Android ARM64
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: arm64-v8a
+          profile: pixel_6
+          emulator-options: -no-snapshot -noaudio -no-boot-anim -gpu swiftshader_indirect
+          disable-animations: true
+          script: bash ci/run_acceptance.sh
+
+      - name: Upload acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beanster-android-acceptance-diagnostics
+          path: ci-artifacts/
+          if-no-files-found: ignore
+
+      - name: Upload tested APKs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beanster-tested-apks
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/release/app-release-unsigned.apk
